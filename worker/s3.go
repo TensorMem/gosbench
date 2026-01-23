@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	s3config "github.com/aws/aws-sdk-go-v2/config"
@@ -24,6 +25,8 @@ import (
 var svc, housekeepingSvc *s3.Client
 var ctx context.Context
 var hc *http.Client
+var noRedirectClient *http.Client // For probe requests 
+var handleRedirect bool
 
 func init() {
 	if err := view.Register([]*view.View{
@@ -59,10 +62,24 @@ func InitS3(config common.S3Configuration) {
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: config.SkipSSLVerify},
 	}
 	tr2 := &ochttp.Transport{Base: tr}
-	hc = &http.Client{
-		Transport: tr2,
+
+	// Store config for use in putObjectWithRedirect
+	handleRedirect = config.HandleRedirect
+	if handleRedirect {
+		log.Info("Redirect handling enabled (application-layer, like AIStore Python SDK)")
 	}
 
+	// HTTP client for performance monitoring
+	hc = &http.Client{Transport: tr2}
+
+	// HTTP client for probe requests that should not follow redirects
+	// Reuses the same transport for connection pooling
+	noRedirectClient = &http.Client{
+		Transport: tr2,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 	// TODO Create a context with a timeout - we already use this context in all S3 calls
 	// Usually this shouldn't be a problem ;)
 	ctx = context.Background()
@@ -114,7 +131,12 @@ func InitS3(config common.S3Configuration) {
 }
 
 func putObject(service *s3.Client, objectName string, objectContent io.ReadSeeker, bucket string) error {
-	// Create an uploader with S3 client and custom options
+	if handleRedirect {
+		// Handle redirects at application layer.
+		return putObjectWithRedirect(objectName, objectContent, bucket)
+	}
+
+	// Use upload manager for non-redirect case (original behavior)
 	uploader := manager.NewUploader(service, func(d *manager.Uploader) {
 		d.MaxUploadParts = 1
 	})
@@ -133,6 +155,84 @@ func putObject(service *s3.Client, objectName string, objectContent io.ReadSeeke
 	log.WithField("bucket", bucket).WithField("key", objectName).Tracef("Upload successful")
 
 	return err
+}
+
+// putObjectWithRedirect implements redirect handling at the application layer,
+// This approach:
+// 1. Sends a probe request (no body) to discover redirect location
+// 2. If redirect found, sends data directly to target
+func putObjectWithRedirect(objectName string, objectContent io.ReadSeeker, bucket string) error {
+	// Build the S3 URL based on path style configuration
+	endpoint := config.S3Config.Endpoint
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return fmt.Errorf("invalid endpoint URL %q: %w", endpoint, err)
+	}
+
+	if config.S3Config.UsePathStyle {
+		u.Path = "/" + bucket + "/" + url.PathEscape(objectName)
+	} else {
+		u.Host = bucket + "." + u.Host
+		u.Path = "/" + url.PathEscape(objectName)
+	}
+	objectURL := u.String()
+
+	// Send probe request (no body, no Content-Length) to discover redirect
+	// exclude data from initial request, use allow_redirects=False equivalent
+	probeReq, err := http.NewRequestWithContext(ctx, http.MethodPut, objectURL, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create probe request: %w", err)
+	}
+	probeReq.Header.Set("Content-Type", "application/octet-stream")
+
+	probeResp, err := noRedirectClient.Do(probeReq)
+	if err != nil {
+		log.WithError(err).Debug("Probe request failed, sending with body directly")
+		return sendToTarget(objectURL, objectContent)
+	}
+
+	// Drain and close response body
+	_, _ = io.Copy(io.Discard, probeResp.Body)
+	probeResp.Body.Close()
+
+	// Check for redirect response
+	if probeResp.StatusCode == http.StatusTemporaryRedirect || probeResp.StatusCode == http.StatusPermanentRedirect {
+		if location := probeResp.Header.Get("Location"); location != "" {
+			log.Debugf("Redirect discovered: %s -> %s", objectURL, location)
+
+			// Send data directly to target
+			return sendToTarget(location, objectContent)
+		}
+	}
+	log.Debugf("Probe returned %d, sending with body to original URL", probeResp.StatusCode)
+
+	// No redirect found - send to original URL with body
+	return sendToTarget(objectURL, objectContent)
+}
+
+// sendToTarget sends the PUT request with body to the target URL.
+func sendToTarget(targetURL string, body io.ReadSeeker) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, targetURL, body)
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+
+	resp, err := hc.Do(req)
+	if err != nil {
+		return fmt.Errorf("PUT request failed: %w", err)
+	}
+
+	// Drain and close response body to free connection
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		log.Tracef("Upload successful to %s", targetURL)
+		return nil
+	}
+
+	return fmt.Errorf("PUT failed with status %d", resp.StatusCode)
 }
 
 // func getObjectProperties(service *s3.S3, objectName string, bucket string) {
