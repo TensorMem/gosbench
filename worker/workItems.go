@@ -158,7 +158,7 @@ func (op *WriteOperation) Do() error {
 func (op *ListOperation) Do() error {
 	log.WithField("bucket", op.Bucket).WithField("object", op.ObjectName).Debug("Doing ListOperation")
 	start := time.Now()
-	_, err := listObjects(svc, op.ObjectName, op.Bucket)
+	_, err := listObjects(housekeepingSvc, op.ObjectName, op.Bucket)
 	duration := time.Since(start)
 	promLatency.WithLabelValues(op.TestName, "LIST").Observe(float64(duration.Milliseconds()))
 	if err != nil {
@@ -173,7 +173,7 @@ func (op *ListOperation) Do() error {
 func (op *DeleteOperation) Do() error {
 	log.WithField("bucket", op.Bucket).WithField("object", op.ObjectName).Debug("Doing DeleteOperation")
 	start := time.Now()
-	err := deleteObject(svc, op.ObjectName, op.Bucket)
+	err := deleteObject(housekeepingSvc, op.ObjectName, op.Bucket)
 	duration := time.Since(start)
 	promLatency.WithLabelValues(op.TestName, "DELETE").Observe(float64(duration.Milliseconds()))
 	if err != nil {

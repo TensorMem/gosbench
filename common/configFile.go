@@ -26,15 +26,17 @@ const (
 
 // S3Configuration contains all information to connect to a certain S3 endpoint
 type S3Configuration struct {
-	AccessKey     string        `yaml:"access_key" json:"access_key"`
-	SecretKey     string        `yaml:"secret_key" json:"secret_key"`
-	Region        string        `yaml:"region" json:"region"`
-	Endpoint      string        `yaml:"endpoint" json:"endpoint"`
-	Timeout       time.Duration `yaml:"timeout" json:"timeout"`
-	SkipSSLVerify bool          `yaml:"skipSSLverify" json:"skipSSLverify"`
-	UsePathStyle  bool          `yaml:"usePathStyle" json:"usePathStyle"`
-	HandleRedirect bool          `yaml:"handleRedirect" json:"handleRedirect"`
-	
+	AccessKey           string        `yaml:"access_key" json:"access_key"`
+	SecretKey           string        `yaml:"secret_key" json:"secret_key"`
+	Region              string        `yaml:"region" json:"region"`
+	Endpoint            string        `yaml:"endpoint" json:"endpoint"`
+	Timeout             time.Duration `yaml:"timeout" json:"timeout"`
+	SkipSSLVerify       bool          `yaml:"skipSSLverify" json:"skipSSLverify"`
+	UsePathStyle        bool          `yaml:"usePathStyle" json:"usePathStyle"`
+	HandleRedirect      bool          `yaml:"handleRedirect" json:"handleRedirect"`
+	CacheMode           bool          `yaml:"cacheMode" json:"cacheMode"`
+	BackendEndpoint     string        `yaml:"backendEndpoint" json:"backendEndpoint"` 
+	BackendEndpointUuid string        `yaml:"backendEndpointUuid" json:"backendEndpointUuid"`
 }
 
 // GrafanaConfiguration contains all information necessary to add annotations

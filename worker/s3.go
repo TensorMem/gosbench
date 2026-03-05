@@ -8,6 +8,8 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	s3config "github.com/aws/aws-sdk-go-v2/config"
@@ -15,6 +17,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go/middleware"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 	log "github.com/sirupsen/logrus"
 
 	"github.com/mulbc/gosbench/common"
@@ -25,7 +29,7 @@ import (
 var svc, housekeepingSvc *s3.Client
 var ctx context.Context
 var hc *http.Client
-var noRedirectClient *http.Client // For probe requests 
+var noRedirectClient *http.Client // For probe requests
 var handleRedirect bool
 
 func init() {
@@ -59,7 +63,14 @@ func InitS3(config common.S3Configuration) {
 	// configuration and credential caching. See the session package for
 	// more information.
 	tr := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: config.SkipSSLVerify},
+		TLSClientConfig:       &tls.Config{InsecureSkipVerify: config.SkipSSLVerify, MinVersion: tls.VersionTLS12},
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   10,
+		MaxConnsPerHost:       2048,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		ForceAttemptHTTP2:     true,
+		IdleConnTimeout:       90 * time.Second,
 	}
 	tr2 := &ochttp.Transport{Base: tr}
 
@@ -123,7 +134,11 @@ func InitS3(config common.S3Configuration) {
 	})
 	// Use this service to do things that are hidden from the performance monitoring
 	housekeepingSvc = s3.NewFromConfig(hkCfg, func(o *s3.Options) {
-		o.BaseEndpoint = aws.String(config.Endpoint)
+		if config.CacheMode {
+			o.BaseEndpoint = aws.String(config.BackendEndpoint)
+		} else {
+			o.BaseEndpoint = aws.String(config.Endpoint)
+		}
 		o.UsePathStyle = config.UsePathStyle
 	})
 
@@ -162,20 +177,10 @@ func putObject(service *s3.Client, objectName string, objectContent io.ReadSeeke
 // 1. Sends a probe request (no body) to discover redirect location
 // 2. If redirect found, sends data directly to target
 func putObjectWithRedirect(objectName string, objectContent io.ReadSeeker, bucket string) error {
-	// Build the S3 URL based on path style configuration
-	endpoint := config.S3Config.Endpoint
-	u, err := url.Parse(endpoint)
+	objectURL, err := buildProbeURL(bucket, objectName)
 	if err != nil {
-		return fmt.Errorf("invalid endpoint URL %q: %w", endpoint, err)
+		return err
 	}
-
-	if config.S3Config.UsePathStyle {
-		u.Path = "/" + bucket + "/" + url.PathEscape(objectName)
-	} else {
-		u.Host = bucket + "." + u.Host
-		u.Path = "/" + url.PathEscape(objectName)
-	}
-	objectURL := u.String()
 
 	// Send probe request (no body, no Content-Length) to discover redirect
 	// exclude data from initial request, use allow_redirects=False equivalent
@@ -208,6 +213,38 @@ func putObjectWithRedirect(objectName string, objectContent io.ReadSeeker, bucke
 
 	// No redirect found - send to original URL with body
 	return sendToTarget(objectURL, objectContent)
+}
+
+func buildProbeURL(bucket string, objectName string) (string, error) {
+	u, err := url.Parse(config.S3Config.Endpoint)
+	if err != nil {
+		return "", fmt.Errorf("invalid endpoint URL %q: %w", config.S3Config.Endpoint, err)
+	}
+
+	if config.S3Config.CacheMode {
+		u.Path = "/v1/objects/" + bucket + "/" + url.PathEscape(objectName)
+	} else if config.S3Config.UsePathStyle {
+		u.Path = "/" + bucket + "/" + url.PathEscape(objectName)
+	} else {
+		u.Host = bucket + "." + u.Host
+		u.Path = "/" + url.PathEscape(objectName)
+	}
+
+	if config.S3Config.CacheMode {
+		q := u.Query()
+		q.Set("provider", "ais")
+		namespace := strings.TrimSpace(config.S3Config.BackendEndpointUuid)
+		if namespace != "" && !strings.HasPrefix(namespace, "@") {
+			namespace = "@" + namespace
+		}
+		if namespace != "" {
+			q.Set("namespace", namespace)
+		}
+		u.RawQuery = q.Encode()
+	}
+
+	log.Debugf("redirect URL: %s", u.String())
+	return u.String(), nil
 }
 
 // sendToTarget sends the PUT request with body to the target URL.
@@ -276,14 +313,20 @@ func listObjects(service *s3.Client, prefix string, bucket string) ([]types.Obje
 }
 
 func getObject(service *s3.Client, objectName string, bucket string, objectSize uint64) error {
-	// Remove the allocation of buffer
 	result, err := service.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: &bucket,
 		Key:    &objectName,
+	}, func(o *s3.Options) {
+		if config.S3Config.CacheMode {
+			o.APIOptions = append(o.APIOptions, addGetQueryParams(config.S3Config.BackendEndpointUuid))
+		}
 	})
 	if err != nil {
 		return err
 	}
+
+	defer result.Body.Close()
+
 	numBytes, err := io.Copy(io.Discard, result.Body)
 	if err != nil {
 		return err
@@ -292,6 +335,37 @@ func getObject(service *s3.Client, objectName string, bucket string, objectSize 
 		return fmt.Errorf("Expected object length %d is not matched to actual object length %d", objectSize, numBytes)
 	}
 	return nil
+}
+
+
+func addGetQueryParams(uuid string) func(*middleware.Stack) error {
+	namespace := strings.TrimSpace(uuid)
+	if namespace != "" && !strings.HasPrefix(namespace, "@") {
+		namespace = "@" + namespace
+	}
+
+	return func(stack *middleware.Stack) error {
+		if err := stack.Build.Add(middleware.BuildMiddlewareFunc("GetQueryParams", func(ctx context.Context, in middleware.BuildInput, next middleware.BuildHandler) (middleware.BuildOutput, middleware.Metadata, error) {
+			req, ok := in.Request.(*smithyhttp.Request)
+			if !ok {
+				return middleware.BuildOutput{}, middleware.Metadata{}, fmt.Errorf("unexpected request type %T", in.Request)
+			}
+
+			q := req.URL.Query()
+			q.Set("provider", "ais")
+			if namespace != "" {
+				q.Set("namespace", namespace)
+			}
+			req.URL.RawQuery = q.Encode()
+			log.Debugf("FULL URL: %s", req.URL.String())
+
+			return next.HandleBuild(ctx, in)
+		}), middleware.After); err != nil {
+			return err
+		}
+
+		return nil
+	}
 }
 
 func deleteObject(service *s3.Client, objectName string, bucket string) error {
